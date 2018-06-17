@@ -45,7 +45,8 @@ int print_certs(shared_ptr<char> data, uint32_t sz) {
       ous.push_back(token);
     }
   }
-  sort(ous.begin(), ous.end(), strcmp);
+  sort(ous.begin(), ous.end(),
+       [](char *a, char *b) { return strcmp(a, b) < 0; });
   for (auto it = ous.cbegin(); it != ous.cend(); ++it) {
     printf("%s\n", *it);
   }
