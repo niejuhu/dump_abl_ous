@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <algorithm>
 #include <memory>
 #include <utility>
 #include <vector>
