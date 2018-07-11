@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <algorithm>
+#include <iostream>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -24,34 +25,49 @@ const int kSignatureSz = 256;
 
 int print_certs(shared_ptr<char> data, uint32_t sz) {
   const unsigned char *p = reinterpret_cast<const unsigned char *>(data.get());
-  unique_ptr<X509, void (*)(X509 *)> cert(d2i_X509(NULL, &p, sz), X509_free);
-  if (!cert) {
-    fprintf(stderr, "Unable to parse cert\n");
-    return -1;
-  }
-
-  char *subj = X509_NAME_oneline(X509_get_subject_name(cert.get()), NULL, 0);
-  if (!subj) {
-    fprintf(stderr, "Unable to get subject\n");
-    return -1;
-  }
-
-  vector<char *> ous;
-  char *token;
-  while ((token = strsep(&subj, "/")) != NULL) {
-    if (token[0] == '\0') {
-      continue;
+  const unsigned char *end = p + sz;
+  int i = 1;
+  while (p < end) {
+    unique_ptr<X509, void (*)(X509 *)> cert(d2i_X509(NULL, &p, sz), X509_free);
+    if (!cert) {
+      fprintf(stderr, "Unable to parse cert\n");
+      return -1;
     }
-    if (strncmp(token, "OU", 2) == 0) {
-      ous.push_back(token);
+
+    char *subj = X509_NAME_oneline(X509_get_subject_name(cert.get()), NULL, 0);
+    if (!subj) {
+      fprintf(stderr, "Unable to get subject\n");
+      return -1;
     }
+    char *issuer = X509_NAME_oneline(X509_get_issuer_name(cert.get()), NULL, 0);
+    if (!issuer) {
+      fprintf(stderr, "Unable to get subject\n");
+      OPENSSL_free(subj);
+      return -1;
+    }
+    printf("Cert %d:\n", i);
+    printf("  Subject: %s\n", subj);
+    printf("  Issuer : %s\n", issuer);
+
+    vector<char *> ous;
+    char *token;
+    while ((token = strsep(&subj, "/")) != NULL) {
+      if (token[0] == '\0') {
+        continue;
+      }
+      if (strncmp(token, "OU", 2) == 0) {
+        ous.push_back(token);
+      }
+    }
+    sort(ous.begin(), ous.end(),
+         [](char *a, char *b) { return strcmp(a, b) < 0; });
+    for (auto it = ous.cbegin(); it != ous.cend(); ++it) {
+      printf("  %s\n", *it);
+    }
+    OPENSSL_free(subj);
+    OPENSSL_free(issuer);
+    ++i;
   }
-  sort(ous.begin(), ous.end(),
-       [](char *a, char *b) { return strcmp(a, b) < 0; });
-  for (auto it = ous.cbegin(); it != ous.cend(); ++it) {
-    printf("%s\n", *it);
-  }
-  OPENSSL_free(subj);
 
   return 0;
 }
