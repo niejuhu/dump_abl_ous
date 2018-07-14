@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <getopt.h>
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
 #include <openssl/x509.h>
@@ -190,13 +191,36 @@ static pair<shared_ptr<char>, uint32_t> elf64_find_cert(ScopedFd &fd) {
   }
 }
 
+static void usage(const char *cmd) {
+  fprintf(stderr, "%s [-d] img\n", cmd);
+  exit(1);
+}
+
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s img\n", argv[0]);
-    return 1;
+  int dump = 0;
+  int c;
+  const char *cmd = argv[0];
+  struct option options[] = {
+      {"dump", no_argument, NULL, 'd'}, {NULL, 0, NULL, 0},
+  };
+  while ((c = getopt_long(argc, argv, "d", options, NULL)) != -1) {
+    switch (c) {
+      case 'd':
+        dump = 1;
+        break;
+      default:
+        usage(cmd);
+        break;
+    }
+  }
+  argc -= optind;
+  argv += optind;
+
+  if (argc != 1) {
+    usage(cmd);
   }
 
-  ScopedFd fd(open(argv[1], O_RDONLY));
+  ScopedFd fd(open(argv[0], O_RDONLY));
   if (!fd) {
     perror("open");
     return 1;
@@ -233,7 +257,25 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (print_certs(data.first, data.second)) {
+  if (dump) {
+    unique_ptr<char[]> fn(new char[strlen(argv[0]) + 5]);
+    if (!fn) {
+      fprintf(stderr, "OOM\n");
+      return 1;
+    }
+    strcpy(fn.get(), argv[0]);
+    strcat(fn.get(), ".ctc");
+    ScopedFd fd(open(fn.get(), O_RDWR | O_CREAT,
+                     S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH));
+    if (!fd) {
+      fprintf(stderr, "Can't open cert file %s\n", fn.get());
+      return 1;
+    }
+    if (write(fd.get(), data.first.get(), data.second) != data.second) {
+      fprintf(stderr, "Can't write to cert file %s\n", fn.get());
+      return 1;
+    }
+  } else if (print_certs(data.first, data.second)) {
     fprintf(stderr, "Failed to print cert\n");
     return 1;
   }
