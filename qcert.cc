@@ -16,19 +16,74 @@
 #include "sys/elf32.h"
 #include "sys/elf64.h"
 
+#ifdef DEBUG
+#define DBG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define DBG
+#endif
+
+#define Elf
+
 using namespace std;
 
 const Elf64_Xword kElfPhdrTypeMask = 7 << 24;
 const Elf64_Xword kElfPhdrTypeHash = 2 << 24;
 const int kSha256Sz = 32;
 const int kHashSegHeaderSz = 40;
+const int kHashSegHeaderSzV6 = 48;
 const int kSignatureSz = 256;
+const int kMaxCerts = 3;
+const int kMbnV6 = 6;
 
-int print_certs(shared_ptr<char> data, uint32_t sz) {
+struct mi_boot_image_header_type {
+  uint32_t res1;            /* Reserved for compatibility: was image_id */
+  uint32_t version;         /* Reserved for compatibility: was header_vsn_num */
+  uint32_t res3;            /* Reserved for compatibility: was image_src */
+  uint32_t res4;            /* Reserved for compatibility: was image_dest_ptr */
+  uint32_t image_size;      /* Size of complete hash segment in bytes */
+  uint32_t code_size;       /* Size of hash table in bytes */
+  uint32_t res5;            /* Reserved for compatibility: was signature_ptr */
+  uint32_t signature_size;  /* Size of the attestation signature in bytes */
+  uint32_t res6;            /* Reserved for compatibility: was cert_chain_ptr */
+  uint32_t cert_chain_size; /* Size of the attestation chain in bytes */
+};
+
+struct mi_boot_image_header_type_v6 {
+  struct mi_boot_image_header_type base;
+  uint32_t qti_md_size;
+  uint32_t md_size;
+};
+
+struct metadata_base {
+  uint32_t major;
+  uint32_t minor;
+};
+
+struct metadata_0_0 {
+  metadata_base base;
+  uint32_t sw_id;
+  uint32_t hw_id;
+  uint32_t oem_id;
+  uint32_t model_id;
+  uint32_t app_id;
+  uint32_t rot_en : 1;
+  uint32_t in_use_soc_hw_version : 1;
+  uint32_t use_serial_number_in_signing : 1;
+  uint32_t oem_id_independent : 1;
+  uint32_t root_revoke_activate_enable : 2;
+  uint32_t uie_key_switch_enable : 2;
+  uint32_t debug : 2;
+  uint32_t soc_vers[12];
+  uint32_t multi_serial_numbers[8];
+  uint32_t mrc_index;
+  uint32_t anti_rollback_version;
+};
+
+static int print_certs(shared_ptr<char> data, uint32_t sz) {
   const unsigned char *p = reinterpret_cast<const unsigned char *>(data.get());
   const unsigned char *end = p + sz;
   int i = 1;
-  while (p < end) {
+  while (p < end && i <= kMaxCerts) {
     unique_ptr<X509, void (*)(X509 *)> cert(d2i_X509(NULL, &p, sz), X509_free);
     if (!cert) {
       fprintf(stderr, "Unable to parse cert\n");
@@ -73,127 +128,174 @@ int print_certs(shared_ptr<char> data, uint32_t sz) {
   return 0;
 }
 
-static pair<shared_ptr<char>, uint32_t> elf32_find_cert(ScopedFd &fd) {
-  Elf32_Ehdr ehdr;
-  pair<shared_ptr<char>, uint32_t> ret;
-  if (read(fd.get(), &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+static int read_file(int fd, uint32_t off, uint32_t len, void *buf) {
+  if (lseek(fd, off, SEEK_SET) == -1) {
+    perror("lseek");
+    return -1;
+  }
+  if (read(fd, buf, len) != len) {
     perror("read");
-    return ret;
+    return -1;
+  }
+  return 0;
+}
+
+static int elf32_find_hashseg(int fd, uint32_t &offset, uint32_t &size) {
+  Elf32_Ehdr ehdr;
+  if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+    perror("read");
+    return -1;
   }
 
   Elf32_Phdr phdr;
-  Elf32_Word data_off = 0;
-  uint32_t data_sz;
-  int hash_count = 0;
   for (int i = 0; i < ehdr.e_phnum; ++i) {
     uint32_t poff = ehdr.e_phoff + i * ehdr.e_phentsize;
-    if (lseek(fd.get(), poff, SEEK_SET) == -1) {
-      perror("lseek");
-      return ret;
-    }
-    if (read(fd.get(), &phdr, sizeof(phdr)) != sizeof(phdr)) {
-      perror("read");
-      return ret;
+    if (read_file(fd, poff, sizeof(phdr), &phdr) == -1) {
+      return -1;
     }
 
-    ++hash_count;
-
-    if (!data_off) {
-      if ((phdr.p_flags & kElfPhdrTypeMask) == kElfPhdrTypeHash) {
-        data_off = phdr.p_offset;
-        data_sz = phdr.p_filesz;
-      }
+    if ((phdr.p_flags & kElfPhdrTypeMask) == kElfPhdrTypeHash) {
+      offset = phdr.p_offset;
+      size = phdr.p_filesz;
+      return 0;
     }
   }
 
-  if (!data_off) {
-    fprintf(stderr, "No hash segment found\n");
-    return ret;
-  } else {
-    Elf32_Word cert_off =
-        data_off + kHashSegHeaderSz + hash_count * kSha256Sz + kSignatureSz;
-    if (lseek(fd.get(), cert_off, SEEK_SET) == -1) {
-      perror("lseek");
-      return ret;
-    }
-    data_sz -= cert_off - data_off;
-    char *data = new char[data_sz];
-    if (!data) {
-      fprintf(stderr, "OOM");
-      return ret;
-    }
-    if (read(fd.get(), data, data_sz) != data_sz) {
-      perror("read");
-      return ret;
-    }
-    ret.first.reset(data);
-    ret.second = data_sz;
-    return ret;
-  }
+  return -1;
 }
 
-static pair<shared_ptr<char>, uint32_t> elf64_find_cert(ScopedFd &fd) {
+static int elf64_find_hashseg(int fd, uint32_t &offset, uint32_t &size) {
   Elf64_Ehdr ehdr;
-  pair<shared_ptr<char>, uint32_t> ret;
-  if (read(fd.get(), &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+  if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
     perror("read");
-    return ret;
+    return -1;
   }
 
   Elf64_Phdr phdr;
-  Elf64_Xword data_off = 0;
-  uint32_t data_sz;
-  int hash_count = 0;
   for (int i = 0; i < ehdr.e_phnum; ++i) {
     uint32_t poff = ehdr.e_phoff + i * ehdr.e_phentsize;
-    if (lseek(fd.get(), poff, SEEK_SET) == -1) {
-      perror("lseek");
-      return ret;
-    }
-    if (read(fd.get(), &phdr, sizeof(phdr)) != sizeof(phdr)) {
-      perror("read");
-      return ret;
+    if (read_file(fd, poff, sizeof(phdr), &phdr) == -1) {
+      return -1;
     }
 
-    ++hash_count;
-
-    if (!data_off) {
-      if ((phdr.p_flags & kElfPhdrTypeMask) == kElfPhdrTypeHash) {
-        data_off = phdr.p_offset;
-        data_sz = phdr.p_filesz;
-      }
+    if ((phdr.p_flags & kElfPhdrTypeMask) == kElfPhdrTypeHash) {
+      offset = phdr.p_offset;
+      size = phdr.p_filesz;
+      return 0;
     }
   }
 
-  if (!data_off) {
-    fprintf(stderr, "No hash segment found\n");
-    return ret;
-  } else {
-    Elf64_Xword cert_off =
-        data_off + kHashSegHeaderSz + hash_count * kSha256Sz + kSignatureSz;
-    if (lseek(fd.get(), cert_off, SEEK_SET) == -1) {
-      perror("lseek");
-      return ret;
-    }
-    data_sz -= cert_off - data_off;
-    char *data = new char[data_sz];
-    if (!data) {
-      fprintf(stderr, "OOM");
-      return ret;
-    }
-    if (read(fd.get(), data, data_sz) != data_sz) {
-      perror("read");
-      return ret;
-    }
-    ret.first.reset(data);
-    ret.second = data_sz;
-    return ret;
-  }
+  return -1;
 }
 
 static void usage(const char *cmd) {
   fprintf(stderr, "%s [-d] img\n", cmd);
-  exit(1);
+  exit(-1);
+}
+
+static int find_hash_segment(int fd, uint32_t &hash_off, uint32_t &hash_sz) {
+  unsigned char ident[EI_NIDENT];
+  if (read(fd, ident, sizeof(ident)) != sizeof(ident)) {
+    perror("read");
+    return -1;
+  }
+  if (ident[0] != ELFMAG0 || ident[1] != ELFMAG1 || ident[2] != ELFMAG2 ||
+      ident[3] != ELFMAG3) {
+    fprintf(stderr, "Not elf format\n");
+    return -1;
+  }
+
+  if (lseek(fd, 0, SEEK_SET) == -1) {
+    perror("lseek");
+    return -1;
+  }
+
+  int ret;
+  if (ident[EI_CLASS] == ELFCLASS32) {
+    ret = elf32_find_hashseg(fd, hash_off, hash_sz);
+  } else if (ident[EI_CLASS] == ELFCLASS64) {
+    ret = elf64_find_hashseg(fd, hash_off, hash_sz);
+  } else {
+    fprintf(stderr, "Invalid elf format\n");
+    return -1;
+  }
+
+  return ret;
+}
+
+static int print_metadata(int fd, uint32_t off, uint32_t sz) {
+  if (sz == 0) {
+    return 0;
+  } else if (sz <= sizeof(metadata_base)) {
+    fprintf(stderr, "invalid metadata\n");
+    return -1;
+  }
+
+  shared_ptr<metadata_base> meta_base(new metadata_base);
+  if (!meta_base) {
+    fprintf(stderr, "OOM\n");
+    return -1;
+  }
+
+  if (read_file(fd, off, sizeof(metadata_base), meta_base.get()) == -1) {
+    return -1;
+  }
+
+  if (meta_base->major != 0 || meta_base->minor != 0) {
+    fprintf(stderr, "unsupported version: %d.%d\n", meta_base->major,
+            meta_base->minor);
+    return -1;
+  }
+
+  // Only support 0.0 now.
+  if (sz != sizeof(metadata_0_0)) {
+    fprintf(stderr, "invalid metadata version 0.0\n");
+    return -1;
+  }
+
+  shared_ptr<metadata_0_0> meta(new metadata_0_0);
+  if (!meta) {
+    fprintf(stderr, "OOM\n");
+    return -1;
+  }
+
+  if (read_file(fd, off, sizeof(metadata_0_0), meta.get()) == -1) {
+    return -1;
+  }
+
+  printf("[*] SW_ID: %x\n", meta->sw_id);
+  printf("[*] HW_ID: %x\n", meta->hw_id);
+  printf("[*] ROLLBACK: %x\n", meta->anti_rollback_version);
+  return 0;
+}
+
+static int print_ous_in_header(
+    int fd, uint32_t hash_off, uint32_t hash_sz,
+    shared_ptr<mi_boot_image_header_type_v6> header) {
+  uint32_t qti_md_sz = header->qti_md_size;
+  uint32_t qti_md_off = hash_off + sizeof(mi_boot_image_header_type_v6);
+  int ret = print_metadata(fd, qti_md_off, qti_md_sz);
+
+  uint32_t md_sz = header->md_size;
+  uint32_t md_off = qti_md_off + qti_md_sz;
+  ret = ret || print_metadata(fd, md_off, md_sz);
+  return ret;
+}
+
+static int find_certs(int fd, uint32_t hash_off, uint32_t hash_sz,
+                      uint32_t cert_off, uint32_t cert_sz) {
+  uint32_t off = hash_off + cert_off;
+  shared_ptr<char> buf(new char[cert_sz]);
+  if (!buf) {
+    fprintf(stderr, "OOM\n");
+    return -1;
+  }
+
+  if (read_file(fd, off, cert_sz, buf.get()) == -1) {
+    return -1;
+  }
+
+  print_certs(buf, cert_sz);
 }
 
 int main(int argc, char **argv) {
@@ -201,8 +303,10 @@ int main(int argc, char **argv) {
   int c;
   const char *cmd = argv[0];
   struct option options[] = {
-      {"dump", no_argument, NULL, 'd'}, {NULL, 0, NULL, 0},
+      {"dump", no_argument, NULL, 'd'},
+      {NULL, 0, NULL, 0},
   };
+
   while ((c = getopt_long(argc, argv, "d", options, NULL)) != -1) {
     switch (c) {
       case 'd':
@@ -223,62 +327,54 @@ int main(int argc, char **argv) {
   ScopedFd fd(open(argv[0], O_RDONLY));
   if (!fd) {
     perror("open");
-    return 1;
+    return -1;
   }
 
-  unsigned char ident[EI_NIDENT];
-  if (read(fd.get(), ident, sizeof(ident)) != sizeof(ident)) {
-    perror("read");
-    return 1;
+  uint32_t hash_off, hash_sz;
+  if (find_hash_segment(fd.get(), hash_off, hash_sz) == -1) {
+    fprintf(stderr, "Can't find hash segment");
+    return -1;
   }
-  if (ident[0] != ELFMAG0 || ident[1] != ELFMAG1 || ident[2] != ELFMAG2 ||
-      ident[3] != ELFMAG3) {
-    fprintf(stderr, "Not elf format\n");
-    return 1;
+  DBG("hash segment: %x %x\n", hash_off, hash_sz);
+
+  shared_ptr<mi_boot_image_header_type> header(new mi_boot_image_header_type);
+  if (!header) {
+    fprintf(stderr, "OOM\n");
+    return -1;
   }
 
-  if (lseek(fd.get(), 0, SEEK_SET) == -1) {
-    perror("lseek");
-    return 1;
+  if (read_file(fd.get(), hash_off, kHashSegHeaderSz, header.get()) == -1) {
+    return -1;
   }
 
-  pair<shared_ptr<char>, uint32_t> data;
-  if (ident[EI_CLASS] == ELFCLASS32) {
-    data = elf32_find_cert(fd);
-  } else if (ident[EI_CLASS] == ELFCLASS64) {
-    data = elf64_find_cert(fd);
+  // TODO: support -d(--dump)
+
+  if (header->version > kMbnV6) {
+    fprintf(stderr, "Unsupported mbn version %d\n", header->version);
+    return -1;
+  } else if (header->version == kMbnV6) {
+    DBG("V6 header\n");
+    shared_ptr<mi_boot_image_header_type_v6> header_v6(
+        new mi_boot_image_header_type_v6);
+    if (read_file(fd.get(), hash_off, kHashSegHeaderSzV6, header_v6.get()) ==
+        -1) {
+      return -1;
+    }
+    uint32_t cert_off = sizeof(mi_boot_image_header_type_v6) +
+                        header_v6->qti_md_size +
+                        header_v6->md_size +
+                        header_v6->base.code_size +
+                        header_v6->base.signature_size;
+    DBG("cert: %x %x\n", cert_off, header_v6->base.cert_chain_size);
+    if (print_ous_in_header(fd.get(), hash_off, hash_sz, header_v6) ||
+        find_certs(fd.get(), hash_off, hash_sz, cert_off,
+                   header_v6->base.cert_chain_size)) {
+      return -1;
+    }
   } else {
-    fprintf(stderr, "Invalid elf format\n");
-    return 1;
+    uint32_t cert_off = sizeof(mi_boot_image_header_type) + header->code_size +
+                        header->signature_size;
+    return find_certs(fd.get(), hash_off, hash_sz, cert_off,
+                      header->cert_chain_size);
   }
-
-  if (!data.first) {
-    fprintf(stderr, "Failed to get cert data\n");
-    return 1;
-  }
-
-  if (dump) {
-    unique_ptr<char[]> fn(new char[strlen(argv[0]) + 5]);
-    if (!fn) {
-      fprintf(stderr, "OOM\n");
-      return 1;
-    }
-    strcpy(fn.get(), argv[0]);
-    strcat(fn.get(), ".ctc");
-    ScopedFd fd(open(fn.get(), O_RDWR | O_CREAT,
-                     S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH));
-    if (!fd) {
-      fprintf(stderr, "Can't open cert file %s\n", fn.get());
-      return 1;
-    }
-    if (write(fd.get(), data.first.get(), data.second) != data.second) {
-      fprintf(stderr, "Can't write to cert file %s\n", fn.get());
-      return 1;
-    }
-  } else if (print_certs(data.first, data.second)) {
-    fprintf(stderr, "Failed to print cert\n");
-    return 1;
-  }
-
-  return 0;
 }

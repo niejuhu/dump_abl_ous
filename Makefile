@@ -1,5 +1,5 @@
 src := qcert.cc
-flags := -Iinclude -lcrypto
+flags := -Iinclude -lcrypto -DDEBUG
 
 qcert : $(src)
 	g++ -o qcert $(src) -std=c++11 $(flags)
