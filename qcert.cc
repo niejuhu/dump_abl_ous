@@ -28,12 +28,11 @@ using namespace std;
 
 const Elf64_Xword kElfPhdrTypeMask = 7 << 24;
 const Elf64_Xword kElfPhdrTypeHash = 2 << 24;
-const int kSha256Sz = 32;
 const int kHashSegHeaderSz = 40;
 const int kHashSegHeaderSzV6 = 48;
-const int kSignatureSz = 256;
 const int kMaxCerts = 3;
 const int kMbnV6 = 6;
+const int kSha1Sz = 20;
 
 struct mi_boot_image_header_type {
   uint32_t res1;            /* Reserved for compatibility: was image_id */
@@ -79,6 +78,25 @@ struct metadata_0_0 {
   uint32_t anti_rollback_version;
 };
 
+static char byte2char(int b) {
+  if (0 <= b && b <= 9) {
+    return b + '0';
+  } else {
+    return b - 10 + 'A';
+  }
+}
+static string hex_encode(const char *bin, int len) {
+  string hex;
+  int i;
+  for (i=0; i<len; ++i) {
+    int hi = (bin[i] >> 4) & 0xf;
+    int lo = bin[i] & 0xf;
+    hex.push_back(byte2char(hi));
+    hex.push_back(byte2char(lo));
+  }
+  return hex;
+}
+
 static int print_certs(shared_ptr<char> data, uint32_t sz) {
   const unsigned char *p = reinterpret_cast<const unsigned char *>(data.get());
   const unsigned char *end = p + sz;
@@ -101,9 +119,20 @@ static int print_certs(shared_ptr<char> data, uint32_t sz) {
       OPENSSL_free(subj);
       return -1;
     }
+    const EVP_MD *digest = EVP_sha1();
+    unsigned len;
+    char buf[kSha1Sz];
+    int rc = X509_digest(cert.get(), digest, (unsigned char*) buf, &len);
+    if (rc == 0 || len != kSha1Sz) {
+      fprintf(stderr, "Unable to get sha1 of cert\n");
+      return -1;
+    }
+    string sha1 = hex_encode(buf, len);
+
     printf("Cert %d:\n", i);
     printf("  Subject: %s\n", subj);
     printf("  Issuer : %s\n", issuer);
+    printf("  Sha1   : %s\n", sha1.c_str());
 
     vector<char *> ous;
     char *token;
@@ -295,7 +324,7 @@ static int find_certs(int fd, uint32_t hash_off, uint32_t hash_sz,
     return -1;
   }
 
-  print_certs(buf, cert_sz);
+  return print_certs(buf, cert_sz);
 }
 
 int main(int argc, char **argv) {
