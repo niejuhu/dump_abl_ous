@@ -97,15 +97,57 @@ static string hex_encode(const char *bin, int len) {
   return hex;
 }
 
-static int print_certs(shared_ptr<char> data, uint32_t sz) {
+static string parse_cert_sn(X509 *cert) {
+  string sn;
+
+  ASN1_INTEGER *serial = X509_get_serialNumber(cert);
+  BIGNUM *bn = ASN1_INTEGER_to_BN(serial, NULL);
+  if (!bn) {
+    fprintf(stderr, "unable to convert ASN1INTEGER to BN\n");
+    return sn;
+  }
+
+  char *tmp = BN_bn2dec(bn);
+  if (!tmp) {
+    fprintf(stderr, "unable to convert BN to decimal string.\n");
+    BN_free(bn);
+    return sn;
+  }
+
+  sn = tmp;
+  BN_free(bn);
+  OPENSSL_free(tmp);
+  return sn;
+}
+
+static int print_certs(shared_ptr<char> data, uint32_t sz, const char *fn=NULL) {
   const unsigned char *p = reinterpret_cast<const unsigned char *>(data.get());
   const unsigned char *end = p + sz;
-  int i = 1;
-  while (p < end && i <= kMaxCerts) {
+  int i = 0;
+  while (p < end && i < kMaxCerts) {
+    ++i;
+    const unsigned char *s = p;
     unique_ptr<X509, void (*)(X509 *)> cert(d2i_X509(NULL, &p, sz), X509_free);
     if (!cert) {
       fprintf(stderr, "Unable to parse cert\n");
       return -1;
+    }
+
+    if (fn) {
+      string fni = fn + to_string(i) + ".cert";
+      DBG("write cert to %s\n", fni.c_str());
+      int fd = open(fni.c_str(), O_WRONLY|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP);
+      if (fd == -1) {
+        perror("open");
+        return -1;
+      }
+      if (write(fd, s, p - s) != p - s) {
+        perror("write");
+        close(fd);
+        return -1;
+      }
+      close(fd);
+      continue;
     }
 
     char *subj = X509_NAME_oneline(X509_get_subject_name(cert.get()), NULL, 0);
@@ -128,11 +170,13 @@ static int print_certs(shared_ptr<char> data, uint32_t sz) {
       return -1;
     }
     string sha1 = hex_encode(buf, len);
+    string sn = parse_cert_sn(cert.get());
 
     printf("Cert %d:\n", i);
     printf("  Subject: %s\n", subj);
     printf("  Issuer : %s\n", issuer);
     printf("  Sha1   : %s\n", sha1.c_str());
+    // printf("  SN     : %s\n", sn.c_str());
 
     vector<char *> ous;
     char *token;
@@ -151,7 +195,6 @@ static int print_certs(shared_ptr<char> data, uint32_t sz) {
     }
     OPENSSL_free(subj);
     OPENSSL_free(issuer);
-    ++i;
   }
 
   return 0;
@@ -312,7 +355,7 @@ static int print_ous_in_header(
 }
 
 static int find_certs(int fd, uint32_t hash_off, uint32_t hash_sz,
-                      uint32_t cert_off, uint32_t cert_sz) {
+                      uint32_t cert_off, uint32_t cert_sz, const char *dump_file) {
   uint32_t off = hash_off + cert_off;
   shared_ptr<char> buf(new char[cert_sz]);
   if (!buf) {
@@ -324,11 +367,16 @@ static int find_certs(int fd, uint32_t hash_off, uint32_t hash_sz,
     return -1;
   }
 
-  return print_certs(buf, cert_sz);
+  if (dump_file) {
+    return print_certs(buf, cert_sz, dump_file);
+  } else {
+    return print_certs(buf, cert_sz);
+  }
 }
 
 int main(int argc, char **argv) {
   int dump = 0;
+  char *dump_file = NULL;
   int c;
   const char *cmd = argv[0];
   struct option options[] = {
@@ -352,6 +400,9 @@ int main(int argc, char **argv) {
   if (argc != 1) {
     usage(cmd);
   }
+  if (dump) {
+    dump_file = argv[0];
+  }
 
   ScopedFd fd(open(argv[0], O_RDONLY));
   if (!fd) {
@@ -361,7 +412,7 @@ int main(int argc, char **argv) {
 
   uint32_t hash_off, hash_sz;
   if (find_hash_segment(fd.get(), hash_off, hash_sz) == -1) {
-    fprintf(stderr, "Can't find hash segment");
+    //fprintf(stderr, "Can't find hash segment\n");
     return -1;
   }
   DBG("hash segment: %x %x\n", hash_off, hash_sz);
@@ -395,15 +446,20 @@ int main(int argc, char **argv) {
                         header_v6->base.code_size +
                         header_v6->base.signature_size;
     DBG("cert: %x %x\n", cert_off, header_v6->base.cert_chain_size);
-    if (print_ous_in_header(fd.get(), hash_off, hash_sz, header_v6) ||
-        find_certs(fd.get(), hash_off, hash_sz, cert_off,
-                   header_v6->base.cert_chain_size)) {
-      return -1;
+    if (dump_file) {
+      return find_certs(fd.get(), hash_off, hash_sz, cert_off,
+                   header_v6->base.cert_chain_size, dump_file);
+    } else {
+      if (print_ous_in_header(fd.get(), hash_off, hash_sz, header_v6) ||
+          find_certs(fd.get(), hash_off, hash_sz, cert_off,
+                     header_v6->base.cert_chain_size, dump_file)) {
+        return -1;
+      }
     }
   } else {
     uint32_t cert_off = sizeof(mi_boot_image_header_type) + header->code_size +
                         header->signature_size;
     return find_certs(fd.get(), hash_off, hash_sz, cert_off,
-                      header->cert_chain_size);
+                      header->cert_chain_size, dump_file);
   }
 }
