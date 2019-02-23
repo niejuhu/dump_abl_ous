@@ -172,7 +172,7 @@ static int print_certs(shared_ptr<char> data, uint32_t sz, const char *fn=NULL) 
     string sha1 = hex_encode(buf, len);
     string sn = parse_cert_sn(cert.get());
 
-    printf("Cert %d:\n", i);
+    printf("[*] Cert %d:\n", i);
     printf("  Subject: %s\n", subj);
     printf("  Issuer : %s\n", issuer);
     printf("  Sha1   : %s\n", sha1.c_str());
@@ -295,7 +295,7 @@ static int find_hash_segment(int fd, uint32_t &hash_off, uint32_t &hash_sz) {
   return ret;
 }
 
-static int print_metadata(int fd, uint32_t off, uint32_t sz) {
+static int print_metadata(int fd, uint32_t off, uint32_t sz, const char *type) {
   if (sz == 0) {
     return 0;
   } else if (sz <= sizeof(metadata_base)) {
@@ -335,9 +335,31 @@ static int print_metadata(int fd, uint32_t off, uint32_t sz) {
     return -1;
   }
 
-  printf("[*] SW_ID: %x\n", meta->sw_id);
-  printf("[*] HW_ID: %x\n", meta->hw_id);
-  printf("[*] ROLLBACK: %x\n", meta->anti_rollback_version);
+  printf("[*] %s METADATA:\n", type);
+  printf("    SW_ID: %x\n", meta->sw_id);
+  printf("    HW_ID(JTAG): %x\n", meta->hw_id);
+  printf("    OEM_ID: %x\n", meta->oem_id);
+  printf("    MODEL_ID: %x\n", meta->model_id);
+  printf("    APP_ID: %x\n", meta->app_id);
+  printf("    SOC_VERS: ");
+  int i;
+  for (i=0; i<12; ++i) {
+    printf("%x, ", meta->soc_vers[i]);
+  }
+  printf("\n");
+  printf("    MULTI_SNS: ");
+  for (i=0; i<8; ++i) {
+    printf("%x, ", meta->multi_serial_numbers[i]);
+  }
+  printf("\n");
+  printf("    ROLLBACK: %x\n", meta->anti_rollback_version);
+  printf("    ROT_EN: %x\n", meta->rot_en);
+  printf("    IN_USE_SOC_HW_VER: %x\n", meta->in_use_soc_hw_version);
+  printf("    USE_SERIAL_NUMBER_IN_SIGNING: %x\n", meta->use_serial_number_in_signing);
+  printf("    OEM_ID_INDEPENDENT: %x\n", meta->oem_id_independent);
+  printf("    ROOT_REVOKE_ACTIVATE_ENABLE: %x\n", meta->root_revoke_activate_enable);
+  printf("    UIE_KEY_SWITCH_ENABLE: %x\n", meta->uie_key_switch_enable);
+  printf("    DEBUG: %x\n", meta->debug);
   return 0;
 }
 
@@ -346,11 +368,11 @@ static int print_ous_in_header(
     shared_ptr<mi_boot_image_header_type_v6> header) {
   uint32_t qti_md_sz = header->qti_md_size;
   uint32_t qti_md_off = hash_off + sizeof(mi_boot_image_header_type_v6);
-  int ret = print_metadata(fd, qti_md_off, qti_md_sz);
+  int ret = print_metadata(fd, qti_md_off, qti_md_sz, "QTI");
 
   uint32_t md_sz = header->md_size;
   uint32_t md_off = qti_md_off + qti_md_sz;
-  ret = ret || print_metadata(fd, md_off, md_sz);
+  ret = ret || print_metadata(fd, md_off, md_sz, "OEM");
   return ret;
 }
 
